@@ -1,21 +1,24 @@
+mod files;
 mod output;
 
 extern crate rusqlite;
 
-use colored::Colorize;
 use console::style;
-use output::{print_error, print_info, print_success, print_warning};
-use core::panic;
+use core::{num, panic};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Input;
+use files::{check_xml_files, delete_temp_db_files, delete_temp_xml_files, generate_xml_file_names};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use output::{print_error, print_info, print_success, print_warning};
 use parse_wiki_text_2::{Configuration, ConfigurationSource, Node};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rusqlite::{Connection, DatabaseName};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, ErrorKind, Seek, SeekFrom, Write};
 use std::os::windows::fs::MetadataExt;
+use std::path::Path;
 use std::time::Duration;
 use std::{env, thread};
 use std::{
@@ -123,7 +126,7 @@ fn main() {
 
     let wikifile = process_args(args);
 
-    let threads_str: String = Input::with_theme(&ColorfulTheme::default())
+   let threads_str: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Number of parsing threads")
         .validate_with(|input: &String| -> Result<(), &str> {
             match input.parse::<usize>() {
@@ -132,34 +135,68 @@ fn main() {
             }
         })
         .interact_text()
-        .unwrap();
+        .unwrap(); 
 
     let num_threads = threads_str.parse::<usize>().unwrap();
 
+    let files = init_fs(wikifile, num_threads);
+    let db_files = spawn_threads(files, num_threads);
+
+    match db_merge(db_files) {
+        Ok(_) => print_success("DB files successfully merged"),
+        Err(e) => print_error(&format!("Failed to merge DB with error {}", e)),
+    }
+
+    std::process::exit(0);
+}
+
+fn init_fs(input_file: String, num_threads: usize) -> Vec<String> {
     match fs::create_dir(TEMP_PATH) {
         Ok(_) => print_info("Temp directory created"),
         Err(e) => {
-            if !(e.kind() == std::io::ErrorKind::AlreadyExists) {
-                panic!("Unknown error creating temp directory: {:?}", e);
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                print_error(&format!("Unknown error creating temp directory: {:?}", e));
+                std::process::exit(-1)
             }
         }
     }
 
-    let files = divide_file_at_boundary(
-        wikifile,
-        "</page>",
-        num_threads.try_into().unwrap(),
-        num_threads,
-    );
-
-    let db_files = spawn_threads(files, num_threads);
-
-    match db_merge(db_files) {
-        Ok(_) => print_success("DB files successfully merged"), 
-        Err(e) => print_error(&format!("Failed to merge DB with error {}", e))
+    match files::delete_temp_db_files(TEMP_PATH.to_string()) {
+        Ok(_) => {},
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                print_error(&format!("Error deleting db file: {}", e))
+            }
+        }
     }
 
-    std::process::exit(0);
+    let xml_files = generate_xml_file_names(input_file.clone(), TEMP_PATH.to_string(), num_threads);
+    match check_xml_files(xml_files.clone(), num_threads, TEMP_PATH.to_string()) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::InvalidData
+            {
+                print_warning("Number of split XML files does not match thread number, deleting and regenerating");
+                match delete_temp_xml_files(TEMP_PATH.to_string()) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            print_error("Could not delete temporary XML file");
+                            std::process::exit(-1);
+                        }
+                    }
+                }
+                
+            }
+            else {
+                print_error("Failed to validate xml subfiles");
+                std::process::exit(-1);
+            }
+        }
+    }
+    
+    return files::divide_file_at_boundary(input_file, "</page>", xml_files, num_threads);
 }
 
 fn process_args(args: Vec<String>) -> String {
@@ -179,7 +216,6 @@ fn spawn_threads(files: Vec<String>, thread_num: usize) -> Vec<String> {
         ProgressStyle::with_template("{prefix:>9} [{wide_bar:.green}] {percent_precise}%")
             .unwrap()
             .progress_chars("#>-");
-
 
     print_header("Parsing");
 
@@ -297,7 +333,6 @@ fn parsing_thread(file: String, num: usize, bar: ProgressBar) -> String {
     return db_path;
 }
 
-
 fn init_db(conn: &mut Connection) {
     conn.pragma_update(Some(DatabaseName::Main), "journal_mode", "OFF")
         .unwrap();
@@ -323,132 +358,13 @@ fn init_db(conn: &mut Connection) {
     .unwrap();
 }
 
-fn divide_file_at_boundary(
-    file: String,
-    boundary: &str,
-    num: u64,
-    num_threads: usize,
-) -> Vec<String> {
-    let (files_exist, out_files) = get_subfiles(file.clone(), num_threads);
-
-    //if not all the files exist, delete any which do and regenerate them
-    if files_exist {
-        print_info("All subfiles already present, proceeding to parse");
-        return out_files;
-    } else {
-        print_info("Number of subfiles is incorrect, regenerating");
-        for i in 0..num_threads {
-            fs::remove_file(&out_files[i]);
-        }
-    }
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_length(num_threads as u64);
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg} ({pos}/{len})")
-            .unwrap()
-            .tick_strings(&["-", "\\", "|", "/"]),
-    );
-    pb.enable_steady_tick(Duration::from_millis(120));
-
-    let in_file = File::open(&file).unwrap();
-    let file_size = in_file.metadata().unwrap().file_size();
-
-    //each split file should ideally be this size
-    let split_size = file_size / num;
-
-    let mut last_split: u64 = 0;
-    for i in 0..num {
-        pb.set_message(format!("Splitting {} to {}", &file, out_files[i as usize]));
-        pb.set_position(i + 1);
-        let out_file = File::create(out_files[i as usize].clone()).unwrap();
-        let mut writer = BufWriter::new(out_file);
-        let mut read_file = in_file.try_clone().unwrap();
-
-        if i == num - 1 {
-            read_file.seek(SeekFrom::Start(last_split));
-
-            let mut take = read_file.take(file_size - last_split);
-            std::io::copy(&mut take, &mut writer);
-
-            writer.flush();
-            continue;
-        }
-
-        let pos = SeekFrom::Start(last_split + split_size);
-        read_file.seek(pos);
-
-        let iter_bytes: usize = 1024;
-        let mut buf = Vec::<u8>::new();
-        buf.resize(1024, 0);
-        loop {
-            read_file.read_exact(&mut buf);
-
-            let buf_string = String::from_utf8(buf.clone());
-            match buf_string {
-                Ok(v) => {
-                    if v.contains(boundary) {
-                        break;
-                    }
-                }
-                Err(_) => continue,
-            }
-            read_file.seek(SeekFrom::Current(iter_bytes.try_into().unwrap()));
-        }
-
-        //get offset at end of </page> tag
-        let buf_string = String::from_utf8(buf).unwrap();
-
-        let string_offset = buf_string.find(boundary).unwrap() + boundary.len();
-        //add to offset within file
-
-        //offset is calculated from the start of the buffer
-        let offset =
-            (read_file.stream_position().unwrap() - iter_bytes as u64) + string_offset as u64;
-
-        //seek back to start in order to read file
-        read_file.seek(SeekFrom::Start(last_split));
-        let mut take = read_file.try_clone().unwrap().take(offset - last_split);
-        std::io::copy(&mut take, &mut writer);
-        writer.flush();
-
-        read_file.rewind().unwrap();
-        last_split = offset;
-    }
-    pb.finish();
-    return out_files;
-}
-
-fn get_subfiles(input_file: String, num_threads: usize) -> (bool, Vec<String>) {
-    let mut out_files = Vec::<String>::with_capacity(num_threads);
-    let mut files_exist = true;
-
-    for i in 0..num_threads {
-        let path = TEMP_PATH.to_string()
-            + input_file.clone().trim_end_matches(".xml")
-            + "-split"
-            + (i + 1).to_string().as_str()
-            + ".xml";
-        out_files.push(path.clone());
-        match File::open(path) {
-            Ok(_) => {}
-            Err(_) => files_exist = false,
-        }
-    }
-
-    if files_exist {
-        return (true, out_files);
-    }
-
-    return (false, out_files);
-}
 
 fn parse_page(content: &String, title: &String, conn: &mut Connection) {
     let result = Configuration::new(&WIKIPEDIA_CONFIG).parse(&content, 5000);
     match result {
         Err(_) => {
             print_warning("Article was skipped due to being unparseable");
-            match add_to_unparseables(title) {
+            match files::add_to_unparseables(title) {
                 Ok(()) => {}
                 Err(_) => print_error("Failed to add article to unparseable list"),
             }
@@ -470,7 +386,7 @@ fn parse_page(content: &String, title: &String, conn: &mut Connection) {
             if links.len() > 0 {
                 match push_page_to_db(conn, links, title) {
                     Ok(_) => {}
-                    Err(E) => println!("{}", style("Failed to push article to database").red()),
+                    Err(_e) => println!("{}", style("Failed to push article to database").red()),
                 }
             }
         }
@@ -505,10 +421,9 @@ fn push_page_to_db(
 fn db_merge(db_files: Vec<String>) -> Result<(), rusqlite::Error> {
     print_header("Merging databases");
 
-    let progress_style =
-        ProgressStyle::with_template("{wide_msg} [{bar:.cyan}] {pos}/{len}%")
-            .unwrap()
-            .progress_chars("#>-");
+    let progress_style = ProgressStyle::with_template("{wide_msg} [{bar:.cyan}] {pos}/{len}%")
+        .unwrap()
+        .progress_chars("#>-");
 
     let pb = ProgressBar::new(db_files.len() as u64).with_style(progress_style);
 
@@ -522,12 +437,13 @@ fn db_merge(db_files: Vec<String>) -> Result<(), rusqlite::Error> {
 
         tx.execute(attach_statement.as_str(), [])?;
 
-
         pb.set_message(format!("Copying articles from {} to merged DB", &db_file));
-        tx.execute("INSERT INTO articles SELECT * FROM dba.articles", [])
-            ?;
+        tx.execute("INSERT INTO articles SELECT * FROM dba.articles", [])?;
 
-        pb.set_message(format!("Copying article_links from {} to merged DB", &db_file));
+        pb.set_message(format!(
+            "Copying article_links from {} to merged DB",
+            &db_file
+        ));
         tx.execute(
             "INSERT INTO article_links SELECT * FROM dba.article_links",
             [],
@@ -536,8 +452,8 @@ fn db_merge(db_files: Vec<String>) -> Result<(), rusqlite::Error> {
         tx.commit()?;
         merge_conn.execute("DETACH DATABASE dba", ())?;
         match fs::remove_file(&db_file) {
-            Ok(_) => {},
-            Err(e) => print_error(&format!("Failed to remove {}", db_file)),
+            Ok(_) => {}
+            Err(_e) => print_error(&format!("Failed to remove {}", db_file)),
         }
 
         pb.tick()
@@ -546,16 +462,3 @@ fn db_merge(db_files: Vec<String>) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-//adds an article to the outputted list of 'unparseables' (articles that the parser took more than max_ms to parse)
-fn add_to_unparseables(title: &String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open("unparseables.txt")?;
-
-    f.seek(SeekFrom::End(0))?;
-    f.write(b"\n")?;
-    f.write(title.as_bytes())?;
-
-    Ok(())
-}

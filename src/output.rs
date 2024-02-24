@@ -1,15 +1,15 @@
 use console::style;
 
 pub fn print_error(output: &str) {
-  eprintln!("{} {}", style("⨯").red().bold(), style(output).red())  
+  eprintln!("{} {}", style("[ERROR]").red().bold(), style(output).red())  
 }
 
 pub fn print_info(output: &str) {
-  println!("{} {}", style("🛈").dim().bold(), style(output).dim())  
+  println!("{} {}", style("[INFO]").dim().bold(), style(output).dim())  
 }
 
 pub fn print_warning(output: &str) {
-  println!("{} {}", style("⚠").yellow().bold(), style(output).yellow())  
+  println!("{} {}", style("[WARN]").yellow().bold(), style(output).yellow())  
 }
 
 pub fn print_header(output: &str) {
